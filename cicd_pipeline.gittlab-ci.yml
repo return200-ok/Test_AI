@@ -1,0 +1,215 @@
+# ──────────────────────────────────────────────────────────────────────
+#  GitLab CI/CD – Optimised Node.js pipeline (Docker-based)
+#
+#  Highlights
+#  ----------
+#  • rule_default → one place to decide dev / staging / prod targets
+#  • Parallel build & test, SonarQube quality-gate blocking
+#  • Resilient retries + Slack alerts on failure / prod deploy results
+#  • Dynamic env names & URLs, DRY templates via `extends`
+# ──────────────────────────────────────────────────────────────────────
+
+stages:
+  - build
+  - test
+  - staging
+  - production
+
+# ──────────────────────────────────────────────────────────────────────
+#  Global variables and reusable blocks
+# ──────────────────────────────────────────────────────────────────────
+variables:
+  BASE_IMAGE: "node:20-alpine"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE:${CI_COMMIT_SHORT_SHA}"
+  # SLACK_WEBHOOK_URL, SONAR_HOST_URL, SONAR_TOKEN must exist in
+  # Settings → CI/CD → Variables (masked/protected as appropriate).
+
+# ---- rule_default ---------------------------------------------------
+# Selects TARGET_ENV (dev, staging, production) from branch or tag.
+# Other jobs inject these rules with:  rules: *rule_default
+.rule_default: &rule_default
+  - if: '$CI_COMMIT_BRANCH == "development"'
+    variables: { TARGET_ENV: "dev"      }
+    when: always
+  - if: '$CI_COMMIT_BRANCH == "staging"'
+    variables: { TARGET_ENV: "staging"  }
+    when: always
+  - if: '$CI_COMMIT_TAG =~ /^(\d+\.)?(\d+\.)?(\*|\d+)$/'
+    variables: { TARGET_ENV: "production" }
+    when: always
+  - when: never
+
+# ---- .notify --------------------------------------------------------
+# Adds retry-logic and Slack alert on **any** job failure
+.notify:
+  retry:
+    max: 2
+    when: runner_system_failure script_failure api_failure
+  after_script: |
+    if [[ "$CI_JOB_STATUS" != "success" ]]; then
+      curl -s -X POST -H 'Content-type: application/json' \
+           --data "{\"text\":\"🚨 ${CI_PROJECT_PATH} – job *${CI_JOB_NAME}* <${CI_JOB_URL}|failed> in pipeline <${CI_PIPELINE_URL}|#${CI_PIPELINE_ID}>.\"}" \
+           "${SLACK_WEBHOOK_URL}" || true
+    fi
+
+# ---- .deploy_base ---------------------------------------------------
+# Common bits for Docker-based deployments
+.deploy_base:
+  extends: .notify
+  image: alpine:latest
+  services: [docker:dind]
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker pull "$IMAGE_TAG"
+
+# ──────────────────────────────────────────────────────────────────────
+#  BUILD stage  (docker image, unit tests, sonar) – runs in parallel
+# ──────────────────────────────────────────────────────────────────────
+docker_build:
+  stage: build
+  image: $BASE_IMAGE
+  services: [docker:dind]
+  extends: .notify
+  script:
+    - npm ci
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build --pull -t "$IMAGE_TAG" .
+    - docker push "$IMAGE_TAG"
+    - echo "$IMAGE_TAG" > image_tag.txt
+  artifacts:
+    paths: [image_tag.txt]
+    expire_in: 1 week
+  interruptible: true          # cancels if a newer pipeline starts
+
+unit_tests:
+  stage: build                  # same stage → runs parallel to docker_build
+  image: $BASE_IMAGE
+  extends: .notify
+  script:
+    - npm ci
+    - npm test -- --ci
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths: [node_modules/]
+
+sonar_scan:
+  stage: build                  # parallel too
+  image: sonarsource/sonar-scanner-cli:latest
+  extends: .notify
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  cache:
+    key: sonar
+    paths: [.sonar/cache]
+  script:
+    - sonar-scanner \
+        -Dsonar.projectKey="$CI_PROJECT_NAME" \
+        -Dsonar.projectName="$CI_PROJECT_NAME" \
+        -Dsonar.sources=src \
+        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+        -Dsonar.host.url="$SONAR_HOST_URL" \
+        -Dsonar.login="$SONAR_TOKEN" \
+        -Dsonar.qualitygate.wait=true \
+        -Dsonar.qualitygate.timeout=300       # 5 min gate timeout
+
+# ──────────────────────────────────────────────────────────────────────
+#  STAGING / DEV deployment  (dynamic via rule_default)
+# ──────────────────────────────────────────────────────────────────────
+deploy_staging:
+  stage: staging
+  <<: *rule_default               # inject dynamic rules
+  extends: [.deploy_base]
+  needs:
+    - job: docker_build           # grab built image tag
+      artifacts: true
+  script:
+    # Skip if this is a production tag (handled later)
+    - |
+      if [[ "$TARGET_ENV" == "production" ]]; then
+        echo "➖ Skipping deploy_staging on production release.";
+        exit 0;
+      fi
+    - echo "🔄  Deploying $IMAGE_TAG to $TARGET_ENV…"
+    # --- Example deployment commands (swap for your infra) ---
+    # kubectl set image deployment/myapp myapp="$IMAGE_TAG" --record
+  environment:
+    name: "${TARGET_ENV}/${CI_COMMIT_REF_SLUG}"
+    url:  "https://${CI_COMMIT_REF_SLUG}.${TARGET_ENV}.example.com"
+
+smoke_tests:
+  stage: staging
+  image: alpine/curl:latest
+  extends: .notify
+  needs: [deploy_staging]
+  rules: *rule_default            # same environment filter
+  script: |
+    if [[ "$TARGET_ENV" == "production" ]]; then
+      echo "➖ Skipping smoke_tests on production release.";
+      exit 0;
+    fi
+    echo "🔥 Smoke tests against $TARGET_ENV…"
+    curl --retry 3 --fail --silent "$CI_ENVIRONMENT_URL/healthz"
+    curl --retry 3 --fail --silent "$CI_ENVIRONMENT_URL/api/version"
+    echo "✅ Smoke tests passed"
+
+# ──────────────────────────────────────────────────────────────────────
+#  PRODUCTION – manual approval + deployment + health-check
+# ──────────────────────────────────────────────────────────────────────
+approve_production:
+  stage: production
+  when: manual
+  extends: .notify
+  rules: *rule_default            # only shows button on production tag
+  script: |
+    if [[ "$TARGET_ENV" != "production" ]]; then
+      echo "➖ Not a production tag – no approval needed."; exit 0;
+    fi
+    echo "Production deployment approved."
+
+deploy_production:
+  stage: production
+  <<: *rule_default
+  extends: [.deploy_base]
+  needs:
+    - job: docker_build
+      artifacts: true
+    - approve_production
+  script: |
+    if [[ "$TARGET_ENV" != "production" ]]; then
+      echo "➖ Skipping deploy_production (not a prod tag)."; exit 0;
+    fi
+    echo "🚀 Deploying $IMAGE_TAG to PRODUCTION…"
+    # --- Insert real-world production deployment commands here ---
+    # kubectl set image deployment/myapp myapp="$IMAGE_TAG" --record
+  environment:
+    name: production
+    url:  https://www.example.com
+  resource_group: production      # serialise prod deploys
+  after_script: |
+    if [[ "$TARGET_ENV" != "production" ]]; then exit 0; fi
+    if [[ "$CI_JOB_STATUS" == "success" ]]; then
+      curl -s -X POST -H 'Content-type: application/json' \
+           --data "{\"text\":\"✅ ${CI_PROJECT_PATH} – *production* deploy succeeded (<${CI_ENVIRONMENT_URL}|live site>).\"}" \
+           "${SLACK_WEBHOOK_URL}" || true
+    else
+      curl -s -X POST -H 'Content-type: application/json' \
+           --data "{\"text\":\"❌ ${CI_PROJECT_PATH} – *production* deploy FAILED (<${CI_JOB_URL}|log>).\"}" \
+           "${SLACK_WEBHOOK_URL}" || true
+    fi
+
+health_checks:
+  stage: production
+  image: alpine/curl:latest
+  extends: .notify
+  needs: [deploy_production]
+  rules: *rule_default
+  script: |
+    if [[ "$TARGET_ENV" != "production" ]]; then
+      echo "➖ Skipping health_checks (not prod)."; exit 0;
+    fi
+    echo "🔍 Post-deployment health checks…"
+    curl --retry 3 --fail --silent https://www.example.com/healthz
+    # kubectl logs deployment/myapp --tail=50   # optional
+    echo "✅ Health checks passed"
